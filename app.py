@@ -1,379 +1,718 @@
 """
 app.py
 ------
-Streamlit app — Milestone 1 (Tasks 1 & 10) + Milestone 2 (Meeting Intelligence Pipeline)
+Milestone 4 — Full Dashboard
+Multi-page Streamlit application.
 
-Flow:
-  Upload → Validate → Transcribe → Display Transcript
-  → Python Analysis → Gemini AI Summary (optional)
+Pages (via sidebar navigation):
+  🔐 Login / Register
+  🏠 Dashboard        — meeting list, search, filters
+  📋 Meeting Details  — transcript, summary, analysis, exports
+  🤖 AI Assistant     — RAG search over all user meetings
+  🔗 Import           — Zoom + Google Meet recording import
+
+All pages are user-scoped. Unauthenticated requests cannot reach private data.
 """
 
-import streamlit as st
+from __future__ import annotations
+
 import time
+from datetime import datetime
+from pathlib import Path
+
+import streamlit as st
+
+# ── Bootstrap DB on every startup ─────────────────────────────────────────────
+import database as db
+db.init_db()
+
+import auth
+import export as exp
 from audio_processor import validate_audio_file, save_uploaded_file, cleanup_temp_file
-from transcriber import transcribe_audio, save_transcript, WHISPER_MODELS
+from transcriber import transcribe_audio, WHISPER_MODELS
 from meeting_analyzer import analyze_transcript
 from gemini_summary import generate_meeting_summary
+import rag_engine
+import zoom_adapter
+import google_meet_adapter
 
-# ── Page config ──────────────────────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Meeting Transcriber",
+    page_title="Meeting Intelligence",
     page_icon="🎙️",
-    layout="centered",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("🎙️ Meeting Transcriber & Analyser")
-st.caption("Powered by OpenAI Whisper + Google Gemini 3.5 Flash — Milestone 1 & 2")
+# ── Global CSS ────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+.meeting-card {
+    background: #f8faff;
+    border: 1px solid #dde3f0;
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin-bottom: 10px;
+}
+.badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 10px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    margin-right: 4px;
+}
+.badge-done     { background:#2ca02c; color:white; }
+.badge-pending  { background:#aaa;    color:white; }
+.badge-proc     { background:#1f77b4; color:white; }
+.badge-failed   { background:#d62728; color:white; }
+.badge-high     { background:#d62728; color:white; }
+.badge-medium   { background:#ff7f0e; color:white; }
+.badge-low      { background:#2ca02c; color:white; }
+.section-head {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #2c3e70;
+    margin-top: 18px;
+    margin-bottom: 6px;
+    border-bottom: 2px solid #dde3f0;
+    padding-bottom: 4px;
+}
+</style>
+""", unsafe_allow_html=True)
 
-# ── Sidebar: model selection ──────────────────────────────────────────────────
-with st.sidebar:
-    st.header("⚙️ Settings")
-    model_size = st.selectbox(
-        "Whisper Model",
-        options=WHISPER_MODELS,
-        index=1,  # default: 'base'
-        help="Larger models are more accurate but slower.",
-    )
-    st.markdown("---")
-    st.markdown(
-        "**Supported formats:** mp3, wav, m4a, mp4, ogg, flac, webm  \n"
-        "**Max file size:** 500 MB"
-    )
-    st.markdown("---")
-    st.subheader("🔑 Gemini API Key")
-    st.markdown(
-        "Set `GEMINI_API_KEY` in a `.env` file next to `app.py`, "
-        "or paste it here for this session only:"
-    )
-    gemini_key_input = st.text_input(
-        "GEMINI_API_KEY (optional override)",
-        type="password",
-        help="Leave blank to use the value from your .env file.",
-    )
-    if gemini_key_input.strip():
-        import os
-        os.environ["GEMINI_API_KEY"] = gemini_key_input.strip()
 
-# ── Step 1: Upload ────────────────────────────────────────────────────────────
-st.subheader("Step 1 · Upload Meeting Recording")
-uploaded_file = st.file_uploader(
-    "Choose an audio or video file",
-    type=["mp3", "wav", "m4a", "mp4", "ogg", "flac", "webm"],
-    help="Upload your meeting recording to transcribe.",
-)
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
-tmp_path = None  # will hold the temp file path during processing
+def _fmt_ts(ts: float | None) -> str:
+    if not ts:
+        return "—"
+    try:
+        return datetime.utcfromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return "—"
 
-if uploaded_file is not None:
-    # ── Step 2: Process / validate audio ─────────────────────────────────────
-    st.subheader("Step 2 · Process Audio")
-    is_valid, validation_msg = validate_audio_file(uploaded_file)
 
-    if not is_valid:
-        st.error(f"❌ {validation_msg}")
-        st.stop()
+def _status_badge(status: str) -> str:
+    cls = {"done": "badge-done", "pending": "badge-pending",
+           "processing": "badge-proc", "failed": "badge-failed"}.get(status, "badge-pending")
+    return f"<span class='badge {cls}'>{status.upper()}</span>"
 
-    st.success(f"✅ {validation_msg}")
 
-    # Show basic file info
-    col1, col2 = st.columns(2)
-    col1.metric("File Name", uploaded_file.name)
-    col2.metric("Size", f"{uploaded_file.size / (1024 * 1024):.2f} MB")
+def _priority_badge(p: str | None) -> str:
+    if not p:
+        return ""
+    cls = {"high": "badge-high", "medium": "badge-medium", "low": "badge-low"}.get(p.lower(), "")
+    return f"<span class='badge {cls}'>{p.upper()}</span>"
 
-    # ── Step 3: Transcribe ────────────────────────────────────────────────────
-    st.subheader("Step 3 · Run Whisper")
-    transcribe_btn = st.button("🚀 Transcribe", use_container_width=True, type="primary")
 
-    if transcribe_btn:
-        try:
-            # Save uploaded bytes to a temp file
-            uploaded_file.seek(0)
-            tmp_path = save_uploaded_file(uploaded_file)
+def _render_action_items(items: list[dict]) -> None:
+    if not items:
+        st.info("No action items.")
+        return
+    for item in items:
+        with st.container(border=True):
+            badges = _priority_badge(item.get("priority"))
+            status_cls = "badge-done" if item.get("status") == "completed" else "badge-pending"
+            badges += f"<span class='badge {status_cls}'>{(item.get('status','pending')).upper()}</span>"
+            st.markdown(badges, unsafe_allow_html=True)
+            st.markdown(f"**Task:** {item.get('task','')}")
+            c1, c2 = st.columns(2)
+            c1.markdown(f"👤 **Assigned:** {item.get('assigned_to') or '—'}")
+            c2.markdown(f"📅 **Deadline:** {item.get('deadline') or '—'}")
 
-            # Progress feedback
-            status = st.status("Processing…", expanded=True)
-            with status:
-                st.write("📂 Audio file saved.")
-                time.sleep(0.3)
 
-                st.write(f"🤖 Loading Whisper **{model_size}** model…")
-                start_time = time.time()
+def _process_meeting(meeting_id: int, user_id: int,
+                     tmp_path: str, whisper_model: str,
+                     run_gemini: bool = True) -> None:
+    """
+    Full processing pipeline: transcribe → analyze → gemini → index.
+    Updates the meeting record at each stage.
+    Cleans up tmp_path on completion or failure.
+    """
+    try:
+        db.update_meeting_status(meeting_id, "processing")
 
-                # ── Step 3 core: run Whisper ──────────────────────────────────
-                result = transcribe_audio(tmp_path, model_size=model_size)
+        # 1. Transcribe
+        result = transcribe_audio(tmp_path, model_size=whisper_model)
+        transcript    = result["text"]
+        language      = result["language"]
+        segments      = result["segments"]
+        duration      = segments[-1]["end"] if segments else None
 
-                elapsed = time.time() - start_time
-                st.write(f"✅ Transcription complete in **{elapsed:.1f}s**.")
-                status.update(label="Transcription complete!", state="complete")
-
-            # Persist result in session state so it survives re-runs
-            st.session_state["transcript"] = result
-
-        except Exception as exc:
-            st.error(f"❌ Transcription failed: {exc}")
-        finally:
-            cleanup_temp_file(tmp_path)
-
-# ── Step 4 & 5: Generate & Display Transcript ─────────────────────────────────
-if "transcript" in st.session_state:
-    result = st.session_state["transcript"]
-
-    st.subheader("Step 4 · Transcript")
-
-    # Metadata row
-    meta_col1, meta_col2, meta_col3 = st.columns(3)
-    meta_col1.metric("Language", result["language"].upper())
-    meta_col2.metric("Model", result["model"])
-    meta_col3.metric("Segments", len(result["segments"]))
-
-    # Full transcript
-    st.markdown("#### Full Transcript")
-    if result["text"]:
-        st.text_area(
-            label="Transcript",
-            value=result["text"],
-            height=300,
-            label_visibility="collapsed",
+        db.save_transcript(
+            meeting_id, transcript, language, whisper_model,
+            duration, None,   # speaker_count filled by analysis
         )
-    else:
-        st.warning("⚠️ Transcript is empty — the audio may contain no speech.")
 
-    # Timed segments (optional expandable view)
-    if result["segments"]:
-        with st.expander("🕐 View timed segments"):
-            for seg in result["segments"]:
-                start = seg.get("start", 0)
-                end = seg.get("end", 0)
-                text = seg.get("text", "").strip()
-                st.markdown(
-                    f"`[{start:6.1f}s → {end:6.1f}s]`  {text}"
-                )
+        # 2. Python analysis
+        analysis = analyze_transcript(transcript, segments)
 
-    # ── Step 5: Save transcript ───────────────────────────────────────────────
-    st.subheader("Step 5 · Save Transcript")
-
-    col_save, col_download = st.columns(2)
-
-    with col_save:
-        save_path = st.text_input(
-            "Save path (.txt)",
-            value=f"transcript_{result['file']}.txt",
-        )
-        if st.button("💾 Save to file"):
+        # 3. Gemini (optional)
+        gemini_result = None
+        if run_gemini:
             try:
-                saved = save_transcript(result["text"], save_path)
-                st.success(f"Saved to `{saved}`")
-            except Exception as exc:
-                st.error(f"Failed to save: {exc}")
+                gemini_result = generate_meeting_summary(transcript)
+            except Exception:
+                gemini_result = None   # Gemini failure must not fail the meeting
 
-    with col_download:
+        db.save_analysis(meeting_id, analysis, gemini_result)
+
+        # 4. Index for RAG
+        try:
+            rag_engine.index_meeting(meeting_id, user_id, transcript)
+        except Exception:
+            pass   # RAG indexing failure doesn't block the meeting
+
+    except Exception as exc:
+        db.update_meeting_status(meeting_id, "failed", str(exc))
+        raise
+    finally:
+        from audio_processor import cleanup_temp_file
+        cleanup_temp_file(tmp_path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Sidebar navigation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sidebar() -> str:
+    with st.sidebar:
+        st.title("🎙️ Meeting Intelligence")
+        st.markdown("---")
+
+        user = auth.get_session_user(st.session_state)
+        if user:
+            st.markdown(f"👤 **{user['username']}**")
+            st.markdown(f"<small>{user['email']}</small>", unsafe_allow_html=True)
+            if st.button("🚪 Logout", use_container_width=True):
+                auth.clear_session(st.session_state)
+                st.rerun()
+            st.markdown("---")
+
+        pages = {
+            "🔐 Login / Register": "auth",
+            "🏠 Dashboard":         "dashboard",
+            "📋 Meeting Details":   "detail",
+            "🤖 AI Assistant":      "rag",
+            "🔗 Import Recordings": "import",
+        }
+        if user:
+            pages.pop("🔐 Login / Register")
+        else:
+            pages = {"🔐 Login / Register": "auth"}
+
+        choice = st.radio("Navigate", list(pages.keys()), label_visibility="collapsed")
+        st.markdown("---")
+        st.caption("Milestone 4 · Whisper + Gemini 3.5 Flash")
+        return pages[choice]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: Auth
+# ══════════════════════════════════════════════════════════════════════════════
+
+def page_auth() -> None:
+    st.title("🔐 Welcome to Meeting Intelligence")
+    tab_login, tab_reg = st.tabs(["Login", "Register"])
+
+    with tab_login:
+        st.subheader("Sign in")
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login", use_container_width=True, type="primary")
+        if submitted:
+            if not username or not password:
+                st.error("Please enter your username and password.")
+            else:
+                ok, result = auth.login(username, password)
+                if ok:
+                    auth.set_session_user(st.session_state, result)
+                    st.success(f"Welcome back, {result['username']}!")
+                    st.rerun()
+                else:
+                    st.error(result)
+
+    with tab_reg:
+        st.subheader("Create account")
+        with st.form("reg_form"):
+            r_user  = st.text_input("Username")
+            r_email = st.text_input("Email")
+            r_pass  = st.text_input("Password", type="password")
+            r_conf  = st.text_input("Confirm password", type="password")
+            r_sub   = st.form_submit_button("Register", use_container_width=True, type="primary")
+        if r_sub:
+            errors = auth.validate_registration(r_user, r_email, r_pass, r_conf)
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                ok, msg = auth.register(r_user, r_email, r_pass)
+                if ok:
+                    st.success("Account created! Please log in.")
+                else:
+                    st.error(msg)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: Dashboard
+# ══════════════════════════════════════════════════════════════════════════════
+
+def page_dashboard(user: dict) -> None:
+    st.title("🏠 Dashboard")
+
+    # ── Upload new meeting ─────────────────────────────────────────────────────
+    with st.expander("➕ Upload new meeting recording", expanded=False):
+        with st.form("upload_form"):
+            title       = st.text_input("Meeting title", placeholder="e.g. Weekly Standup — Sep 2")
+            up_file     = st.file_uploader(
+                "Audio/video file",
+                type=["mp3", "wav", "m4a", "mp4", "ogg", "flac", "webm"],
+            )
+            col_m, col_g = st.columns(2)
+            w_model     = col_m.selectbox("Whisper model", WHISPER_MODELS, index=1)
+            use_gemini  = col_g.checkbox("Run Gemini AI summary", value=True)
+            up_sub      = st.form_submit_button("🚀 Upload & Process", type="primary",
+                                                use_container_width=True)
+
+        if up_sub:
+            if not title.strip():
+                st.error("Please enter a meeting title.")
+            elif up_file is None:
+                st.error("Please select a file.")
+            else:
+                is_valid, msg = validate_audio_file(up_file)
+                if not is_valid:
+                    st.error(f"❌ {msg}")
+                else:
+                    up_file.seek(0)
+                    tmp = save_uploaded_file(up_file)
+                    mid = db.create_meeting(
+                        user_id=user["id"],
+                        title=title.strip(),
+                        filename=up_file.name,
+                        file_size_bytes=up_file.size,
+                        provider="upload",
+                    )
+                    with st.spinner("Processing… (this may take a minute)"):
+                        try:
+                            _process_meeting(mid, user["id"], tmp, w_model, use_gemini)
+                            st.success("✅ Meeting processed successfully!")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"❌ Processing failed: {exc}")
+
+    st.markdown("---")
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    col_s, col_f = st.columns([3, 1])
+    search_q  = col_s.text_input("🔍 Search meetings", placeholder="Search title or transcript…",
+                                  label_visibility="collapsed")
+    status_f  = col_f.selectbox("Filter", ["All", "done", "processing", "pending", "failed"],
+                                 label_visibility="collapsed")
+
+    # ── Meeting list ──────────────────────────────────────────────────────────
+    meetings = db.list_meetings(
+        user_id=user["id"],
+        status=None if status_f == "All" else status_f,
+        search=search_q.strip() or None,
+    )
+
+    if not meetings:
+        st.info("No meetings found. Upload your first recording above.")
+        return
+
+    st.markdown(f"**{len(meetings)} meeting(s)**")
+
+    for m in meetings:
+        with st.container():
+            st.markdown(f"""
+            <div class='meeting-card'>
+                <b>{m['title']}</b>
+                {_status_badge(m['status'])}
+                <span style='color:#888;font-size:0.85rem;float:right'>{_fmt_ts(m['created_at'])}</span><br>
+                <small>📁 {m['filename']}
+                {"&nbsp;&nbsp;🌐 " + m['language'].upper() if m.get('language') else ""}
+                {"&nbsp;&nbsp;👥 " + str(m['speaker_count']) + " speakers" if m.get('speaker_count') else ""}
+                {"&nbsp;&nbsp;🔗 " + m['provider'].title() if m.get('provider') else ""}
+                </small>
+            </div>
+            """, unsafe_allow_html=True)
+            c1, c2, c3 = st.columns([2, 1, 1])
+            if c1.button("📋 View Details", key=f"view_{m['id']}", use_container_width=True):
+                st.session_state["selected_meeting_id"] = m["id"]
+                st.session_state["nav_override"] = "detail"
+                st.rerun()
+            if c2.button("🗑️ Delete", key=f"del_{m['id']}", use_container_width=True):
+                db.delete_meeting(m["id"], user["id"])
+                st.rerun()
+            if m["status"] == "failed" and c3.button("🔄 Retry", key=f"retry_{m['id']}", use_container_width=True):
+                # Re-create a fresh meeting record for retry
+                st.info("Re-upload the file to retry processing.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: Meeting Detail
+# ══════════════════════════════════════════════════════════════════════════════
+
+def page_detail(user: dict) -> None:
+    mid = st.session_state.get("selected_meeting_id")
+    if not mid:
+        st.warning("No meeting selected. Go to the Dashboard and click 'View Details'.")
+        return
+
+    meeting = db.get_meeting(mid, user["id"])
+    if not meeting:
+        st.error("Meeting not found or access denied.")
+        return
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.title(f"📋 {meeting['title']}")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Status",   meeting["status"].upper())
+    col2.metric("Language", (meeting.get("language") or "—").upper())
+    col3.metric("Speakers", meeting.get("speaker_count") or "—")
+    col4.metric("Provider", (meeting.get("provider") or "upload").title())
+
+    st.markdown(f"**Created:** {_fmt_ts(meeting.get('created_at'))}  |  "
+                f"**Processed:** {_fmt_ts(meeting.get('processed_at'))}  |  "
+                f"**File:** {meeting.get('filename','—')}")
+
+    if meeting["status"] == "failed":
+        st.error(f"Processing failed: {meeting.get('error_message','unknown error')}")
+        return
+    if meeting["status"] in ("pending", "processing"):
+        st.info("⏳ This meeting is still being processed. Refresh in a moment.")
+        return
+
+    # ── Exports ───────────────────────────────────────────────────────────────
+    st.markdown("---")
+    exp_col1, exp_col2 = st.columns(2)
+    with exp_col1:
+        pdf_bytes = exp.export_pdf(meeting)
         st.download_button(
-            label="⬇️ Download transcript",
-            data=result["text"],
-            file_name=f"transcript_{result['file']}.txt",
-            mime="text/plain",
+            "📄 Download PDF Report",
+            data=pdf_bytes,
+            file_name=exp.safe_filename(meeting["title"], "pdf"),
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    with exp_col2:
+        csv_bytes = exp.export_csv(meeting)
+        st.download_button(
+            "📊 Download CSV Report",
+            data=csv_bytes,
+            file_name=exp.safe_filename(meeting["title"], "csv"),
+            mime="text/csv",
             use_container_width=True,
         )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 6 · Meeting Analysis  (Milestone 2 — Meeting Intelligence Pipeline)
-# ══════════════════════════════════════════════════════════════════════════════
-if "transcript" in st.session_state and st.session_state["transcript"]["text"]:
-    result = st.session_state["transcript"]
-
     st.markdown("---")
-    st.header("🔍 Step 6 · Meeting Analysis")
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Helper: render a priority badge inline
-    # ────────────────────────────────────────────────────────────────────────
-    _PRIORITY_COLOUR = {"high": "#d62728", "medium": "#ff7f0e", "low": "#2ca02c"}
+    # ── Summary ───────────────────────────────────────────────────────────────
+    if meeting.get("summary"):
+        st.markdown("<div class='section-head'>📝 Summary</div>", unsafe_allow_html=True)
+        st.markdown(meeting["summary"])
 
-    def _priority_badge(priority: str | None) -> str:
-        if not priority:
-            return ""
-        colour = _PRIORITY_COLOUR.get(priority.lower(), "#888")
-        label  = priority.upper()
-        return (
-            f"<span style='background:{colour};color:white;"
-            f"padding:2px 8px;border-radius:8px;font-size:0.78rem;"
-            f"font-weight:bold;'>{label}</span>"
-        )
+    # ── Decisions ─────────────────────────────────────────────────────────────
+    st.markdown("<div class='section-head'>🎯 Key Decisions</div>", unsafe_allow_html=True)
+    decisions = meeting.get("decisions") or []
+    if decisions:
+        for d in decisions:
+            st.markdown(f"- {d}")
+    else:
+        st.info("No decisions recorded.")
 
-    def _status_badge(status: str | None) -> str:
-        colour = "#2ca02c" if status == "completed" else "#888"
-        label  = (status or "pending").upper()
-        return (
-            f"<span style='background:{colour};color:white;"
-            f"padding:2px 8px;border-radius:8px;font-size:0.78rem;'>{label}</span>"
-        )
-
-    # ────────────────────────────────────────────────────────────────────────
-    # Shared helper: render an action-items list (used for both paths)
-    # ────────────────────────────────────────────────────────────────────────
-    def _render_action_items(items: list[dict]) -> None:
-        if not items:
-            st.info("No action items detected in this transcript.")
-            return
-        for item in items:
-            assigned = item.get("assigned_to") or "—"
-            deadline = item.get("deadline")    or "—"
-            priority = item.get("priority")
-            status   = item.get("status", "pending")
-            with st.container(border=True):
-                badge_html = _priority_badge(priority) + "  " + _status_badge(status)
-                st.markdown(badge_html, unsafe_allow_html=True)
-                st.markdown(f"**Task:** {item['task']}")
-                col_a, col_d = st.columns(2)
-                col_a.markdown(f"👤 **Assigned to:** {assigned}")
-                col_d.markdown(f"📅 **Deadline:** {deadline}")
-
-    # ── 6a. Python-based analysis ────────────────────────────────────────────
-    run_analysis = st.button(
-        "🧠 Run Analysis",
-        use_container_width=True,
-        type="primary",
-        help="Runs fully offline Python extraction (no API key needed).",
-    )
-
-    if run_analysis:
-        with st.spinner("Running Python analysis…"):
-            analysis = analyze_transcript(
-                transcript=result["text"],
-                segments=result["segments"],
-            )
-        st.session_state["analysis"] = analysis
-
-    if "analysis" in st.session_state:
-        analysis = st.session_state["analysis"]
-
-        # ── Speaker count ────────────────────────────────────────────────────
-        st.subheader("👥 Estimated Speakers")
-        st.metric(
-            label="Distinct voices detected",
-            value=analysis["speaker_count"],
-            help=(
-                "Estimated using KMeans clustering on Whisper segment features "
-                "(duration, position, log-probability, words-per-second). "
-                "Acoustic estimate only — may differ from true count."
-            ),
-        )
-
-        # ── Topics ───────────────────────────────────────────────────────────
-        st.subheader("📌 Key Topics")
-        topics = analysis["topics"]
-        if topics:
-            cols = st.columns(min(len(topics), 4))
-            for i, topic in enumerate(topics):
-                cols[i % 4].markdown(
-                    f"<span style='background:#1f77b4;color:white;"
-                    f"padding:4px 10px;border-radius:12px;"
-                    f"font-size:0.85rem;'>{topic}</span>",
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.info("No distinct topics extracted from this transcript.")
-
+    # ── Participants ──────────────────────────────────────────────────────────
+    st.markdown("<div class='section-head'>🙋 Participants</div>", unsafe_allow_html=True)
+    participants = meeting.get("participants") or []
+    if participants:
+        st.markdown("  ".join(
+            f"<span style='background:#e377c2;color:white;padding:3px 9px;"
+            f"border-radius:10px;font-size:0.85rem;'>{p}</span>"
+            for p in participants
+        ), unsafe_allow_html=True)
         st.markdown(" ")
+    else:
+        st.info("No participants identified.")
 
-        # ── Key discussion points ────────────────────────────────────────────
-        st.subheader("💡 Key Discussion Points")
-        key_points = analysis["key_points"]
-        if key_points:
-            for i, point in enumerate(key_points, 1):
-                st.markdown(f"**{i}.** {point}")
+    # ── Key Points ────────────────────────────────────────────────────────────
+    st.markdown("<div class='section-head'>💡 Key Discussion Points</div>", unsafe_allow_html=True)
+    kp = meeting.get("key_points") or []
+    if kp:
+        for i, p in enumerate(kp, 1):
+            st.markdown(f"**{i}.** {p}")
+    else:
+        st.info("No key points recorded.")
+
+    # ── Topics ────────────────────────────────────────────────────────────────
+    st.markdown("<div class='section-head'>📌 Topics</div>", unsafe_allow_html=True)
+    topics = meeting.get("topics") or []
+    if topics:
+        cols = st.columns(min(len(topics), 5))
+        for i, t in enumerate(topics):
+            cols[i % 5].markdown(
+                f"<span style='background:#1f77b4;color:white;padding:4px 10px;"
+                f"border-radius:12px;font-size:0.85rem;'>{t}</span>",
+                unsafe_allow_html=True,
+            )
+        st.markdown(" ")
+    else:
+        st.info("No topics extracted.")
+
+    # ── Action Items ──────────────────────────────────────────────────────────
+    st.markdown("<div class='section-head'>✅ Action Items</div>", unsafe_allow_html=True)
+    _render_action_items(meeting.get("action_items") or [])
+
+    # ── All Deadlines ─────────────────────────────────────────────────────────
+    deadlines = meeting.get("all_deadlines") or []
+    if deadlines:
+        with st.expander(f"📅 All dates/deadlines found ({len(deadlines)})"):
+            for d in deadlines:
+                st.markdown(f"• {d}")
+
+    # ── Transcript ────────────────────────────────────────────────────────────
+    st.markdown("<div class='section-head'>📜 Full Transcript</div>", unsafe_allow_html=True)
+    if meeting.get("transcript"):
+        st.text_area("Transcript", value=meeting["transcript"], height=300,
+                     label_visibility="collapsed")
+    else:
+        st.info("Transcript not available.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: AI Assistant (RAG)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def page_rag(user: dict) -> None:
+    st.title("🤖 AI Meeting Assistant")
+    st.caption("Ask questions about any of your meetings. "
+               "Answers are grounded only in your recorded meetings.")
+
+    query = st.text_input("Ask a question about your meetings",
+                          placeholder="e.g. What were the decisions about the API integration?")
+
+    if st.button("🔍 Search & Answer", type="primary", use_container_width=True):
+        if not query.strip():
+            st.warning("Please enter a question.")
         else:
-            st.info("No key points extracted.")
+            with st.spinner("Searching your meetings and generating answer…"):
+                result = rag_engine.answer(user["id"], query.strip())
 
-        # ── Action items (Python path — now includes priority + status) ──────
-        st.subheader("✅ Action Items")
-        _render_action_items(analysis["action_items"])
+            st.markdown("---")
 
-        # ── All dates / deadlines ────────────────────────────────────────────
-        all_deadlines = analysis["all_deadlines"]
-        if all_deadlines:
-            with st.expander(f"📅 All dates/deadlines found ({len(all_deadlines)})"):
-                for d in all_deadlines:
-                    st.markdown(f"• {d}")
+            if result.get("error"):
+                st.error(f"Error: {result['error']}")
 
-    # ── 6b. Gemini AI summary (Milestone 2 — full intelligence pipeline) ─────
-    st.markdown("---")
-    st.subheader("✨ AI Meeting Intelligence  *(Gemini 3.5 Flash)*")
-    st.caption(
-        "Gemini reads the full transcript and produces a structured analysis. "
-        "Requires `GEMINI_API_KEY`. "
-        "All output is strictly constrained to the transcript — "
-        "the model cannot invent names, decisions, tasks, or dates."
-    )
+            if result.get("no_sources"):
+                st.warning("🔍 No relevant meeting content found for this question.")
+            else:
+                st.markdown("### 💬 Answer")
+                st.markdown(result["answer"])
 
-    run_gemini = st.button(
-        "🚀 Generate AI Summary",
-        use_container_width=True,
-        help="Calls Gemini 3.5 Flash. Requires GEMINI_API_KEY.",
-    )
+                sources = result.get("sources", [])
+                if sources:
+                    st.markdown("### 📚 Sources")
+                    for s in sources:
+                        with st.container(border=True):
+                            date_str = _fmt_ts(s.get("meeting_date"))
+                            score_pct = f"{s['score']*100:.0f}% match"
+                            st.markdown(
+                                f"**{s['meeting_title']}** — {date_str} "
+                                f"<span style='color:#888;font-size:0.8rem;'>({score_pct})</span>",
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown(f"> *{s['excerpt'][:400]}…*")
 
-    if run_gemini:
-        with st.spinner("Calling Gemini 3.5 Flash…"):
-            try:
-                gemini_result = generate_meeting_summary(result["text"])
-                st.session_state["gemini_result"] = gemini_result
-            except TypeError as exc:
-                st.error(f"❌ Input error: {exc}")
-            except ValueError as exc:
-                st.error(f"❌ Schema / validation error: {exc}")
-            except RuntimeError as exc:
-                st.error(f"❌ API error: {exc}")
-            except Exception as exc:
-                st.error(f"❌ Unexpected error: {exc}")
+    # ── Re-index button ────────────────────────────────────────────────────────
+    with st.expander("⚙️ Re-index all meetings"):
+        st.caption("Run this if search results seem stale after re-processing a meeting.")
+        if st.button("🔄 Re-index now"):
+            meetings = db.list_meetings(user["id"], status="done")
+            count = 0
+            for m in meetings:
+                if m.get("transcript"):
+                    rag_engine.index_meeting(m["id"], user["id"], m["transcript"])
+                    count += 1
+            st.success(f"Re-indexed {count} meeting(s).")
 
-    if "gemini_result" in st.session_state:
-        gr = st.session_state["gemini_result"]
 
-        # ── Truncation warning (Task 1) ───────────────────────────────────
-        if gr.get("_truncation_warning"):
-            st.warning(gr["_truncation_warning"])
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: Import (Zoom + Google Meet)
+# ══════════════════════════════════════════════════════════════════════════════
 
-        # ── Summary (Task 2) ──────────────────────────────────────────────
-        if gr.get("summary"):
-            st.markdown("#### 📝 Summary")
-            st.markdown(gr["summary"])
+def page_import(user: dict) -> None:
+    st.title("🔗 Import Recordings")
 
-        # ── Key decisions (Task 2 — new field) ───────────────────────────
-        if gr.get("decisions"):
-            st.markdown("#### 🎯 Key Decisions")
-            for d in gr["decisions"]:
-                st.markdown(f"- {d}")
+    tab_zoom, tab_gmeet = st.tabs(["Zoom", "Google Meet"])
 
-        # ── Participants (Task 2 — new field) ────────────────────────────
-        if gr.get("participants"):
-            st.markdown("#### 🙋 Participants")
-            st.markdown("  ".join(
-                f"<span style='background:#e377c2;color:white;"
-                f"padding:3px 9px;border-radius:10px;"
-                f"font-size:0.83rem;'>{p}</span>"
-                for p in gr["participants"]
-            ), unsafe_allow_html=True)
-            st.markdown(" ")
+    # ── ZOOM ──────────────────────────────────────────────────────────────────
+    with tab_zoom:
+        if zoom_adapter.LIVE_MODE:
+            st.success("✅ Zoom credentials configured — live mode active.")
+        else:
+            st.warning(
+                "⚠️ Zoom credentials not configured. Showing demo recordings.\n\n"
+                "Add `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET` to your `.env` "
+                "to connect your real Zoom account."
+            )
 
-        # ── Key points ────────────────────────────────────────────────────
-        if gr.get("key_points"):
-            st.markdown("#### 💡 Key Points")
-            for pt in gr["key_points"]:
-                st.markdown(f"- {pt}")
+        if st.button("🔄 Refresh Zoom recordings", use_container_width=True):
+            st.session_state.pop("zoom_recs", None)
 
-        # ── Topics ────────────────────────────────────────────────────────
-        if gr.get("topics"):
-            st.markdown("#### 📌 Topics")
-            st.markdown("  ".join(f"`{t}`" for t in gr["topics"]))
+        if "zoom_recs" not in st.session_state:
+            with st.spinner("Fetching Zoom recordings…"):
+                try:
+                    st.session_state["zoom_recs"] = zoom_adapter.list_recordings()
+                except Exception as exc:
+                    st.error(f"Failed to fetch Zoom recordings: {exc}")
+                    st.session_state["zoom_recs"] = []
 
-        # ── Action items (Task 3 — now with priority + status) ────────────
-        if gr.get("action_items") is not None:
-            st.markdown("#### ✅ Action Items")
-            _render_action_items(gr["action_items"])
+        recs = st.session_state.get("zoom_recs", [])
+        if not recs:
+            st.info("No Zoom recordings found.")
+        else:
+            col_m, col_g = st.columns(2)
+            w_model    = col_m.selectbox("Whisper model", WHISPER_MODELS, index=1, key="zoom_model")
+            use_gemini = col_g.checkbox("Run Gemini AI summary", value=True, key="zoom_gemini")
 
-        # ── Raw JSON (debug / audit) ──────────────────────────────────────
-        with st.expander("🔎 View raw Gemini JSON response"):
-            import json as _json
-            # Exclude internal key from display
-            display = {k: v for k, v in gr.items() if not k.startswith("_")}
-            st.code(_json.dumps(display, indent=2), language="json")
+            for rec in recs:
+                with st.container(border=True):
+                    mock_label = " 🎭 DEMO" if rec.get("mock") else ""
+                    st.markdown(f"**{rec['topic']}**{mock_label}")
+                    st.markdown(
+                        f"📅 {rec['start_time'][:10]}  |  "
+                        f"⏱ {rec['duration']} min  |  "
+                        f"📦 {rec['file_size']//1024//1024} MB  |  "
+                        f"🎞 {rec['file_type']}"
+                    )
+
+                    already = db.provider_meeting_exists(user["id"], "zoom", rec["provider_id"])
+                    if already:
+                        st.success("✅ Already imported")
+                    elif rec.get("mock"):
+                        st.info("Demo recording — cannot download without real Zoom credentials.")
+                    else:
+                        if st.button("⬇️ Import", key=f"zoom_{rec['provider_id']}",
+                                     use_container_width=True):
+                            mid = db.create_meeting(
+                                user_id=user["id"],
+                                title=rec["topic"],
+                                filename=f"{rec['topic']}.{rec['file_type'].lower()}",
+                                file_size_bytes=rec["file_size"],
+                                provider="zoom",
+                                provider_id=rec["provider_id"],
+                                provider_meta=rec,
+                            )
+                            with st.spinner("Downloading and processing…"):
+                                try:
+                                    tmp, fname = zoom_adapter.download_recording(rec)
+                                    _process_meeting(mid, user["id"], tmp, w_model, use_gemini)
+                                    st.success("✅ Imported successfully!")
+                                    st.rerun()
+                                except Exception as exc:
+                                    db.update_meeting_status(mid, "failed", str(exc))
+                                    st.error(f"Import failed: {exc}")
+
+    # ── GOOGLE MEET ───────────────────────────────────────────────────────────
+    with tab_gmeet:
+        if google_meet_adapter.LIVE_MODE:
+            st.success("✅ Google credentials configured — live mode active.")
+        else:
+            st.warning(
+                "⚠️ Google credentials not configured. Showing demo recordings.\n\n"
+                "To connect Google Meet, run:\n"
+                "```\npython google_meet_adapter.py --auth\n```\n"
+                "Then add `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, "
+                "`GOOGLE_REFRESH_TOKEN` to your `.env`."
+            )
+
+        if st.button("🔄 Refresh Google Meet recordings", use_container_width=True):
+            st.session_state.pop("gmeet_recs", None)
+
+        if "gmeet_recs" not in st.session_state:
+            with st.spinner("Fetching Google Meet recordings…"):
+                try:
+                    st.session_state["gmeet_recs"] = google_meet_adapter.list_recordings()
+                except Exception as exc:
+                    st.error(f"Failed to fetch Google Meet recordings: {exc}")
+                    st.session_state["gmeet_recs"] = []
+
+        g_recs = st.session_state.get("gmeet_recs", [])
+        if not g_recs:
+            st.info("No Google Meet recordings found.")
+        else:
+            gcol_m, gcol_g = st.columns(2)
+            gw_model    = gcol_m.selectbox("Whisper model", WHISPER_MODELS, index=1, key="gm_model")
+            guse_gemini = gcol_g.checkbox("Run Gemini AI summary", value=True, key="gm_gemini")
+
+            for rec in g_recs:
+                with st.container(border=True):
+                    mock_label = " 🎭 DEMO" if rec.get("mock") else ""
+                    st.markdown(f"**{rec['topic']}**{mock_label}")
+                    st.markdown(
+                        f"📅 {rec['start_time'][:10]}  |  "
+                        f"📦 {rec['file_size']//1024//1024} MB"
+                    )
+
+                    already = db.provider_meeting_exists(user["id"], "google_meet", rec["provider_id"])
+                    if already:
+                        st.success("✅ Already imported")
+                    elif rec.get("mock"):
+                        st.info("Demo recording — cannot download without Google credentials.")
+                    else:
+                        if st.button("⬇️ Import", key=f"gmeet_{rec['provider_id']}",
+                                     use_container_width=True):
+                            mid = db.create_meeting(
+                                user_id=user["id"],
+                                title=rec["topic"],
+                                filename=f"{rec['topic']}.mp4",
+                                file_size_bytes=rec["file_size"],
+                                provider="google_meet",
+                                provider_id=rec["provider_id"],
+                                provider_meta=rec,
+                            )
+                            with st.spinner("Downloading and processing…"):
+                                try:
+                                    tmp, fname = google_meet_adapter.download_recording(rec)
+                                    _process_meeting(mid, user["id"], tmp, gw_model, guse_gemini)
+                                    st.success("✅ Imported successfully!")
+                                    st.rerun()
+                                except Exception as exc:
+                                    db.update_meeting_status(mid, "failed", str(exc))
+                                    st.error(f"Import failed: {exc}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main router
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    page = _sidebar()
+
+    # Allow detail page to be triggered from dashboard
+    override = st.session_state.pop("nav_override", None)
+    if override:
+        page = override
+
+    user = auth.get_session_user(st.session_state)
+
+    if page == "auth" or not user:
+        page_auth()
+        return
+
+    if page == "dashboard":
+        page_dashboard(user)
+    elif page == "detail":
+        page_detail(user)
+    elif page == "rag":
+        page_rag(user)
+    elif page == "import":
+        page_import(user)
+
+
+if __name__ == "__main__":
+    main()

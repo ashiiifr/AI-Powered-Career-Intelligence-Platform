@@ -1,10 +1,10 @@
 @echo off
-title Meeting Transcriber ^& Analyser
+title Meeting Intelligence Platform
 
 echo.
 echo  ================================================
-echo   Meeting Transcriber ^& Analyser
-echo   Milestone 1 ^& 2
+echo   Meeting Intelligence Platform
+echo   Milestone 1, 2 and 4
 echo  ================================================
 echo.
 
@@ -35,26 +35,33 @@ if not exist "%~dp0myenv\Scripts\streamlit.exe" (
 :: ── Check for .env file ───────────────────────────────────────────────────
 if not exist "%~dp0.env" (
     echo  [WARNING] .env file not found.
-    echo  The AI summary feature requires GEMINI_API_KEY.
+    echo  The AI summary and Zoom features require API keys.
     echo.
-    echo  To set it up:
+    echo  To set up:
     echo    copy .env.example .env
-    echo    Then edit .env and add your key.
+    echo    Then edit .env and add your keys.
     echo.
-    echo  The app will still run — Python analysis works without a key.
+    echo  The app will still run without keys (mock mode for providers).
     echo.
 )
 
+:: ── Run DB init / check ────────────────────────────────────────────────────
+echo  Initialising database...
+"%~dp0myenv\Scripts\python.exe" -c "import database; database.init_db(); print('  Database ready.')" 2>nul
+if errorlevel 1 (
+    echo  [WARNING] Could not pre-initialise database - app will handle it on startup.
+)
+
 :: ── Start the app ─────────────────────────────────────────────────────────
-echo  Starting Streamlit...
+echo.
+echo  Starting app...
 echo  Open your browser at: http://localhost:8501
 echo.
-echo  Press Ctrl+C to stop the app.
+echo  Press Ctrl+C to stop.
 echo.
 
 "%~dp0myenv\Scripts\streamlit.exe" run "%~dp0app.py"
 
-:: ── Reached here means the app exited ────────────────────────────────────
 echo.
 echo  App stopped.
 pause

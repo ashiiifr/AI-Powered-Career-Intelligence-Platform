@@ -1,6 +1,10 @@
 # ── Secrets — NEVER commit these ─────────────────────────────────────────────
 .env
 
+# ── SQLite database (generated at runtime) ───────────────────────────────────
+meetings.db
+*.db
+
 # ── Python virtual environment ────────────────────────────────────────────────
 myenv/
 venv/

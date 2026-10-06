@@ -1,17 +1,36 @@
-# Core transcription
+# ── Transcription ─────────────────────────────────────────────────────────────
 openai-whisper
 ffmpeg-python
 imageio[ffmpeg]
 
-# Streamlit UI
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
 streamlit
 
-# Meeting analysis (Python deterministic extraction)
+# ── Meeting analysis (deterministic NLP) ─────────────────────────────────────
 nltk
 scikit-learn
 
-# Gemini AI summary
+# ── Gemini AI (LLM service) ───────────────────────────────────────────────────
 google-genai>=2.0.0
 
-# Environment variable management
+# ── Persistence (SQLite — built into Python, no extra install needed) ─────────
+# sqlite3 is part of the stdlib
+
+# ── Authentication ────────────────────────────────────────────────────────────
+argon2-cffi
+passlib
+
+# ── RAG / embeddings ─────────────────────────────────────────────────────────
+sentence-transformers
+
+# ── PDF export ────────────────────────────────────────────────────────────────
+fpdf2
+
+# ── HTTP client (Zoom + Google adapters) ─────────────────────────────────────
+httpx
+
+# ── Environment variables ─────────────────────────────────────────────────────
 python-dotenv
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+pytest
